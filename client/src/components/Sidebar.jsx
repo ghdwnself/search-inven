@@ -20,6 +20,12 @@ function Sidebar({ activeView, setActiveView }) {
           >
             🔍 다중 검색
           </li>
+          <li
+            className={`menu-item ${activeView === 'admin' ? 'active' : ''}`}
+            onClick={() => setActiveView('admin')}
+          >
+            🛠 관리자
+          </li>
         </ul>
       </nav>
     </aside>

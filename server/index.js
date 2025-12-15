@@ -7,6 +7,8 @@ import { google } from 'googleapis';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
+import { parse } from 'csv-parse/sync';
+import multer from 'multer';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -32,6 +34,7 @@ try {
   if (envVars.GOOGLE_SHEET_ID) process.env.GOOGLE_SHEET_ID = envVars.GOOGLE_SHEET_ID;
   if (envVars.GOOGLE_INVENTORY_SHEET_ID) process.env.GOOGLE_INVENTORY_SHEET_ID = envVars.GOOGLE_INVENTORY_SHEET_ID;
   if (envVars.GOOGLE_DRIVE_FOLDER_ID) process.env.GOOGLE_DRIVE_FOLDER_ID = envVars.GOOGLE_DRIVE_FOLDER_ID;
+  if (envVars.ADMIN_PASSWORD) process.env.ADMIN_PASSWORD = envVars.ADMIN_PASSWORD;
   
   console.log('✅ .env 파일 로드 완료');
 } catch (error) {
@@ -56,14 +59,18 @@ const PORT = 5000;
 app.use(cors());
 app.use(express.json());
 
+// Multer 설정 (메모리 저장)
+const upload = multer({ storage: multer.memoryStorage() });
+
 // 메모리 캐시
 let products = [];
 let imageMap = {};
 let inventoryMap = {}; // SKU별 재고 정보
+let pendingProducts = []; // 승인 대기 제품
 
 // Google Sheets 인증 설정
 const SCOPES = [
-  'https://www.googleapis.com/auth/spreadsheets.readonly',
+  'https://www.googleapis.com/auth/spreadsheets',
   'https://www.googleapis.com/auth/drive.readonly'
 ];
 
@@ -172,6 +179,65 @@ async function loadInventoryData() {
   }
 }
 
+// Google Sheets 승인 대기 데이터 로드
+async function loadPendingData() {
+  try {
+    const sheetId = process.env.GOOGLE_SHEET_ID;
+    const doc = new GoogleSpreadsheet(sheetId, serviceAccountAuth);
+
+    console.log('⏳ 승인 대기 데이터 로딩 중...');
+    
+    await doc.loadInfo();
+
+    // item_pending 시트 찾기 또는 생성
+    let pendingSheet = null;
+    for (let i = 0; i < doc.sheetCount; i++) {
+      const sheet = doc.sheetsByIndex[i];
+      if (sheet.title.toLowerCase() === 'item_pending') {
+        pendingSheet = sheet;
+        console.log(`✅ item_pending 시트 발견`);
+        break;
+      }
+    }
+
+    // 시트가 없으면 생성
+    if (!pendingSheet) {
+      console.log('📝 item_pending 시트 생성 중...');
+      pendingSheet = await doc.addSheet({
+        title: 'item_pending',
+        headerValues: ['SKU', 'Brand', 'ProductName', 'Category', 'SubCategory', 'Size', 'Color', 'SubmittedBy', 'SubmittedAt', 'Status']
+      });
+      console.log('✅ item_pending 시트 생성 완료');
+      return; // 새로 생성했으면 데이터 없음
+    }
+
+    await pendingSheet.loadHeaderRow();
+    const rows = await pendingSheet.getRows();
+    console.log(`📦 총 ${rows.length}개의 승인 대기 제품 로드됨`);
+
+    // pendingProducts 배열 초기화
+    pendingProducts = [];
+    rows.forEach(row => {
+      pendingProducts.push({
+        sku: row.get('SKU') || '',
+        brand: row.get('Brand') || '',
+        productName: row.get('ProductName') || '',
+        category: row.get('Category') || '',
+        subCategory: row.get('SubCategory') || '',
+        size: row.get('Size') || '',
+        color: row.get('Color') || '',
+        submittedBy: row.get('SubmittedBy') || '',
+        submittedAt: row.get('SubmittedAt') || '',
+        status: row.get('Status') || 'pending'
+      });
+    });
+
+    console.log(`✅ ${pendingProducts.length}개의 승인 대기 제품 매핑됨`);
+  } catch (error) {
+    console.error('❌ 승인 대기 데이터 로드 실패:', error.message);
+  }
+}
+
 // Google Sheets 데이터 로드
 async function loadSheetData() {
   try {
@@ -272,6 +338,7 @@ async function initializeServer() {
     console.log('🚀 서버 초기화 중...');
     await loadImagesFromDrive();
     await loadInventoryData();
+    await loadPendingData(); // 승인 대기 데이터 로드 추가
     await loadSheetData();
     console.log('✨ 서버 초기화 완료!');
   } catch (error) {
@@ -382,6 +449,511 @@ app.get('/api/images/:sku', async (req, res) => {
     res.status(500).json({ error: '이미지 로드 실패' });
   }
 });
+
+// ============================================
+// 신규 제품 등록 API
+// ============================================
+
+// 관리자 인증 미들웨어
+function adminAuth(req, res, next) {
+  const password = req.headers['x-admin-password'];
+  if (password !== process.env.ADMIN_PASSWORD) {
+    return res.status(401).json({ error: '관리자 권한이 필요합니다' });
+  }
+  next();
+}
+
+// SKU 중복 체크
+app.get('/api/check-sku/:sku', async (req, res) => {
+  try {
+    const { sku } = req.params;
+    
+    // 기존 제품 확인
+    const existsInProducts = products.some(p => p.SKU === sku);
+    // 승인 대기 제품 확인
+    const existsInPending = pendingProducts.some(p => p.sku === sku);
+    
+    res.json({
+      exists: existsInProducts || existsInPending,
+      location: existsInProducts ? 'products' : existsInPending ? 'pending' : null
+    });
+  } catch (error) {
+    console.error('SKU 체크 실패:', error.message);
+    res.status(500).json({ error: 'SKU 체크 실패' });
+  }
+});
+
+// 신규 제품 등록 (승인 대기)
+app.post('/api/products/pending', async (req, res) => {
+  try {
+    const productData = req.body;
+    
+    // 필수 필드 검증
+    if (!productData.sku || !productData.brand || !productData.productName) {
+      return res.status(400).json({ error: '필수 항목이 누락되었습니다 (SKU, Brand, ProductName)' });
+    }
+    
+    // SKU 중복 체크
+    const existsInProducts = products.some(p => p.SKU === productData.sku);
+    const existsInPending = pendingProducts.some(p => p.sku === productData.sku);
+    
+    if (existsInProducts || existsInPending) {
+      return res.status(409).json({ error: 'SKU가 이미 존재합니다' });
+    }
+    
+    // Google Sheets에 추가
+    const sheetId = process.env.GOOGLE_SHEET_ID;
+    const doc = new GoogleSpreadsheet(sheetId, serviceAccountAuth);
+    await doc.loadInfo();
+    
+    // item_pending 시트 찾기
+    let pendingSheet = null;
+    for (let i = 0; i < doc.sheetCount; i++) {
+      const sheet = doc.sheetsByIndex[i];
+      if (sheet.title.toLowerCase() === 'item_pending') {
+        pendingSheet = sheet;
+        break;
+      }
+    }
+    
+    if (!pendingSheet) {
+      return res.status(500).json({ error: 'item_pending 시트를 찾을 수 없습니다' });
+    }
+    
+    // 새 행 추가
+    const newRow = {
+      SKU: productData.sku,
+      Brand: productData.brand,
+      ProductName: productData.productName,
+      Category: productData.category || '',
+      SubCategory: productData.subCategory || '',
+      Size: productData.size || '',
+      Color: productData.color || '',
+      SubmittedBy: productData.submittedBy || 'Anonymous',
+      SubmittedAt: new Date().toISOString(),
+      Status: 'pending'
+    };
+    
+    await pendingSheet.addRow(newRow);
+    
+    // 메모리 캐시에도 추가
+    pendingProducts.push({
+      sku: productData.sku,
+      brand: productData.brand,
+      productName: productData.productName,
+      category: productData.category || '',
+      subCategory: productData.subCategory || '',
+      size: productData.size || '',
+      color: productData.color || '',
+      submittedBy: productData.submittedBy || 'Anonymous',
+      submittedAt: new Date().toISOString(),
+      status: 'pending'
+    });
+    
+    res.json({ 
+      success: true, 
+      message: '제품이 승인 대기 목록에 추가되었습니다',
+      product: newRow
+    });
+  } catch (error) {
+    console.error('제품 등록 실패:', error.message);
+    res.status(500).json({ error: '제품 등록 실패' });
+  }
+});
+
+// 승인 대기 목록 조회
+app.get('/api/products/pending', (req, res) => {
+  res.json(pendingProducts);
+});
+
+// 제품 승인 (관리자 전용)
+app.post('/api/products/approve/:sku', adminAuth, async (req, res) => {
+  try {
+    const { sku } = req.params;
+    
+    // 승인 대기 목록에서 찾기
+    const pendingIndex = pendingProducts.findIndex(p => p.sku === sku);
+    if (pendingIndex === -1) {
+      return res.status(404).json({ error: '해당 SKU를 찾을 수 없습니다' });
+    }
+    
+    const productToApprove = pendingProducts[pendingIndex];
+    
+    // Google Sheets 접근
+    const sheetId = process.env.GOOGLE_SHEET_ID;
+    const doc = new GoogleSpreadsheet(sheetId, serviceAccountAuth);
+    await doc.loadInfo();
+    
+    // item_pending 시트에서 삭제
+    let pendingSheet = null;
+    for (let i = 0; i < doc.sheetCount; i++) {
+      const currentSheet = doc.sheetsByIndex[i];
+      if (currentSheet.title.toLowerCase() === 'item_pending') {
+        pendingSheet = currentSheet;
+        break;
+      }
+    }
+    
+    if (pendingSheet) {
+      const rows = await pendingSheet.getRows();
+      const rowToDelete = rows.find(row => row.get('SKU') === sku);
+      if (rowToDelete) {
+        await rowToDelete.delete();
+      }
+    }
+    
+    // item_master 시트 찾기
+    let masterSheet = null;
+    for (let i = 0; i < doc.sheetCount; i++) {
+      const currentSheet = doc.sheetsByIndex[i];
+      const title = currentSheet.title.toLowerCase();
+      if (title === 'item_master' || 
+          (title.includes('item') && title.includes('master'))) {
+        masterSheet = currentSheet;
+        break;
+      }
+    }
+    
+    if (!masterSheet) {
+      console.error('item_master 시트를 찾을 수 없습니다');
+      return res.status(500).json({ error: 'item_master 시트를 찾을 수 없습니다' });
+    }
+    
+    // item_master에 새 행 추가 (34개 컬럼 모두 정의)
+    const newRow = {
+      SKU: productToApprove.sku || '',
+      UPC: '',
+      ProductName_Short: productToApprove.productName || '',
+      Brand: productToApprove.brand || '',
+      Category: productToApprove.category || '',
+      Sub_Category: productToApprove.subCategory || '',
+      Size_Capacity: productToApprove.size || '',
+      Shape: '',
+      Color_Pattern: productToApprove.color || '',
+      Feature: '',
+      MaterialMain: '',
+      Vendor: '',
+      CasePack: '',
+      UnitsPerCase: '',
+      MasterCarton_Length_inches: '',
+      MasterCarton_Width_inches: '',
+      MasterCarton_Height_inches: '',
+      MasterCarton_Length_cm: '',
+      MasterCarton_Width_cm: '',
+      MasterCarton_Height_cm: '',
+      MasterCarton_Weight_lbs: '',
+      MasterCarton_Weight_kg: '',
+      CBM_per_Case: '',
+      CBM_per_Unit: '',
+      Max_Cartons_per_Pallet: '',
+      'Max Height_per_Pallet': '',
+      CountryOfOrigin: '',
+      FOB_Cost: '',
+      LandedCost: '',
+      WholesalePrice: '',
+      MSRP: '',
+      MAP: '',
+      KeyAccountPrice_TJX: '',
+      KeyAccountPrice_Costco: ''
+    };
+    
+    // 2번째 행을 헤더로 사용 (1번째 행은 제목행)
+    await masterSheet.loadHeaderRow(2);
+    await masterSheet.addRow(newRow);
+    
+    // 메모리 캐시 업데이트
+    products.push({
+      SKU: productToApprove.sku,
+      Brand: productToApprove.brand,
+      ProductName_Short: productToApprove.productName,
+      Category: productToApprove.category || '',
+      Sub_Category: productToApprove.subCategory || '',
+      Size_Capacity: productToApprove.size || '',
+      Color_Pattern: productToApprove.color || '',
+      inventory: inventoryMap[productToApprove.sku] || []
+    });
+    
+    // products 배열도 정렬
+    products.sort((a, b) => {
+      const skuA = (a.SKU || '').toUpperCase();
+      const skuB = (b.SKU || '').toUpperCase();
+      return skuA < skuB ? -1 : skuA > skuB ? 1 : 0;
+    });
+    
+    // 승인 대기 목록에서 제거
+    pendingProducts.splice(pendingIndex, 1);
+    
+    res.json({ 
+      success: true, 
+      message: '제품이 승인되어 메인 시트에 추가되었습니다' 
+    });
+  } catch (error) {
+    console.error('제품 승인 실패:', error.message);
+    res.status(500).json({ error: '제품 승인 실패: ' + error.message });
+  }
+});
+
+// 제품 거부 (관리자 전용)
+app.post('/api/products/reject/:sku', adminAuth, async (req, res) => {
+  try {
+    const { sku } = req.params;
+    const { reason } = req.body;
+    
+    // 승인 대기 목록에서 찾기
+    const pendingIndex = pendingProducts.findIndex(p => p.sku === sku);
+    if (pendingIndex === -1) {
+      return res.status(404).json({ error: '해당 SKU를 찾을 수 없습니다' });
+    }
+    
+    // Google Sheets에서 삭제
+    const sheetId = process.env.GOOGLE_SHEET_ID;
+    const doc = new GoogleSpreadsheet(sheetId, serviceAccountAuth);
+    await doc.loadInfo();
+    
+    // item_pending 시트에서 삭제
+    let pendingSheet = null;
+    for (let i = 0; i < doc.sheetCount; i++) {
+      const currentSheet = doc.sheetsByIndex[i];
+      if (currentSheet.title.toLowerCase() === 'item_pending') {
+        pendingSheet = currentSheet;
+        break;
+      }
+    }
+    
+    if (pendingSheet) {
+      const rows = await pendingSheet.getRows();
+      const rowToDelete = rows.find(row => row.get('SKU') === sku);
+      if (rowToDelete) {
+        await rowToDelete.delete();
+        console.log(`✅ item_pending에서 ${sku} 삭제 완료 (거부)`);
+      }
+    }
+    
+    // 승인 대기 목록에서 제거
+    pendingProducts.splice(pendingIndex, 1);
+    
+    res.json({ 
+      success: true, 
+      message: '제품이 거부되었습니다',
+      reason: reason || ''
+    });
+  } catch (error) {
+    console.error('제품 거부 실패:', error.message);
+    res.status(500).json({ error: '제품 거부 실패' });
+  }
+});
+
+// 엑셀 템플릿 다운로드
+app.get('/api/template/download', (req, res) => {
+  try {
+    // CSV 템플릿 생성 (UTF-8 BOM 추가로 Excel 한글 호환)
+    const headers = [
+      'SKU',
+      'Brand',
+      'ProductName',
+      'Category',
+      'SubCategory',
+      'Size',
+      'Color',
+      'SubmittedBy'
+    ];
+    
+    // 예시 데이터 (가이드용)
+    const exampleData = [
+      ['NF-001', 'Notion Finds', 'Ceramic Mug', 'Kitchen', 'Drinkware', '12oz', 'White', '홍길동'],
+      ['NF-002', 'Notion Finds', 'Glass Vase', 'Decor', 'Vases', 'Medium', 'Clear', '김철수']
+    ];
+    
+    // CSV 문자열 생성
+    const rows = [headers, ...exampleData];
+    const csvContent = rows.map(row => 
+      row.map(cell => {
+        // 쉼표, 따옴표, 줄바꿈 포함 시 이스케이프
+        const str = String(cell);
+        if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+          return `"${str.replace(/"/g, '""')}"`;
+        }
+        return str;
+      }).join(',')
+    ).join('\r\n');
+    
+    // UTF-8 BOM 추가 (Excel에서 한글 깨짐 방지)
+    const BOM = '\uFEFF';
+    const buffer = Buffer.from(BOM + csvContent, 'utf8');
+    
+    // 응답 헤더 설정
+    res.setHeader('Content-Disposition', 'attachment; filename="product_template.csv"');
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Length', buffer.length);
+    
+    res.send(buffer);
+  } catch (error) {
+    console.error('템플릿 다운로드 실패:', error.message);
+    res.status(500).json({ error: '템플릿 다운로드 실패' });
+  }
+});
+
+// 엑셀 파일 업로드 및 일괄 등록
+app.post('/api/products/upload', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: '파일이 업로드되지 않았습니다' });
+    }
+    
+    // 파일 타입 체크 (Excel 파일 업로드 방지)
+    const fileSignature = req.file.buffer.slice(0, 4).toString('hex');
+    if (fileSignature === '504b0304') { // ZIP/XLSX 파일 시그니처
+      return res.status(400).json({ 
+        error: 'Excel 파일(.xlsx)은 지원하지 않습니다. CSV 템플릿을 다운로드하여 사용해주세요.' 
+      });
+    }
+    
+    // CSV 파일 읽기 (UTF-8 BOM 처리)
+    let csvContent = req.file.buffer.toString('utf8');
+    
+    // UTF-8 BOM 제거
+    if (csvContent.charCodeAt(0) === 0xFEFF) {
+      csvContent = csvContent.slice(1);
+    }
+    
+    // CSV 파싱
+    let data;
+    try {
+      const records = parse(csvContent, {
+        columns: true,
+        skip_empty_lines: true,
+        trim: true,
+        bom: true
+      });
+      
+      if (records.length === 0) {
+        return res.status(400).json({ error: 'CSV 파일에 데이터가 없습니다' });
+      }
+      
+      data = records;
+    } catch (parseError) {
+      console.error('CSV 파싱 실패:', parseError.message);
+      return res.status(400).json({ 
+        error: 'CSV 파일 형식이 올바르지 않습니다. CSV 템플릿을 다운로드하여 사용해주세요.' 
+      });
+    }
+    
+    const results = {
+      success: [],
+      errors: [],
+      duplicates: []
+    };
+    
+    // Google Sheets 접근
+    const sheetId = process.env.GOOGLE_SHEET_ID;
+    const doc = new GoogleSpreadsheet(sheetId, serviceAccountAuth);
+    await doc.loadInfo();
+    
+    // item_pending 시트 찾기
+    let pendingSheet = null;
+    for (let i = 0; i < doc.sheetCount; i++) {
+      const sheet = doc.sheetsByIndex[i];
+      if (sheet.title.toLowerCase() === 'item_pending') {
+        pendingSheet = sheet;
+        break;
+      }
+    }
+    
+    if (!pendingSheet) {
+      return res.status(500).json({ error: 'item_pending 시트를 찾을 수 없습니다' });
+    }
+    
+    // 각 행 처리
+    for (let i = 0; i < data.length; i++) {
+      const row = data[i];
+      const rowNum = i + 2; // 엑셀 행 번호 (헤더 제외)
+      
+      // 필수 필드 검증
+      if (!row.SKU || !row.Brand || !row.ProductName) {
+        results.errors.push({
+          row: rowNum,
+          sku: row.SKU || '',
+          error: '필수 항목 누락 (SKU, Brand, ProductName)'
+        });
+        continue;
+      }
+      
+      // SKU 중복 체크
+      const existsInProducts = products.some(p => p.SKU === row.SKU);
+      const existsInPending = pendingProducts.some(p => p.sku === row.SKU);
+      
+      if (existsInProducts || existsInPending) {
+        results.duplicates.push({
+          row: rowNum,
+          sku: row.SKU,
+          location: existsInProducts ? 'products' : 'pending'
+        });
+        continue;
+      }
+      
+      // item_pending 시트에 추가
+      try {
+        const newRow = {
+          SKU: row.SKU,
+          Brand: row.Brand,
+          ProductName: row.ProductName,
+          Category: row.Category || '',
+          SubCategory: row.SubCategory || '',
+          Size: row.Size || '',
+          Color: row.Color || '',
+          SubmittedBy: row.SubmittedBy || 'Excel Upload',
+          SubmittedAt: new Date().toISOString(),
+          Status: 'pending'
+        };
+        
+        await pendingSheet.addRow(newRow);
+        
+        // 메모리 캐시에도 추가
+        pendingProducts.push({
+          sku: row.SKU,
+          brand: row.Brand,
+          productName: row.ProductName,
+          category: row.Category || '',
+          subCategory: row.SubCategory || '',
+          size: row.Size || '',
+          color: row.Color || '',
+          submittedBy: row.SubmittedBy || 'Excel Upload',
+          submittedAt: new Date().toISOString(),
+          status: 'pending'
+        });
+        
+        results.success.push({
+          row: rowNum,
+          sku: row.SKU,
+          name: row.ProductName
+        });
+      } catch (error) {
+        results.errors.push({
+          row: rowNum,
+          sku: row.SKU,
+          error: '시트 추가 실패: ' + error.message
+        });
+      }
+    }
+    
+    res.json({
+      message: '업로드 완료',
+      total: data.length,
+      successCount: results.success.length,
+      errorCount: results.errors.length,
+      duplicateCount: results.duplicates.length,
+      results
+    });
+  } catch (error) {
+    console.error('CSV 업로드 실패:', error.message);
+    console.error('전체 에러:', error);
+    res.status(500).json({ error: 'CSV 업로드 실패: ' + error.message });
+  }
+});
+
+// ============================================
+// 기존 API
+// ============================================
 
 // 헬스 체크
 app.get('/api/health', (req, res) => {
