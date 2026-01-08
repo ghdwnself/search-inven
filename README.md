@@ -1,4 +1,4 @@
-# 이미지 기반 재고 조회 시스템 (v1)
+# 이미지 기반 재고 조회 시스템
 
 Google Sheets와 Google Drive를 연동한 재고 조회 시스템입니다.
 
@@ -16,17 +16,24 @@ inven/
 │   │   │   ├── Sidebar.jsx
 │   │   │   ├── SearchView.jsx
 │   │   │   ├── BulkSearchView.jsx
+│   │   │   ├── AdminView.jsx
 │   │   │   └── ProductCard.jsx
 │   │   ├── App.jsx
 │   │   ├── main.jsx
 │   │   └── index.css
 │   ├── public/
-│   │   └── nf_logo.png  # 로고 파일 (직접 추가 필요)
+│   │   └── nf_logo.png  # 로고 파일 (선택사항)
 │   ├── index.html
 │   ├── vite.config.js
 │   └── package.json
-├── .env                 # 환경 변수 설정
+├── data/                # 데이터 파일 (템플릿)
+│   └── products_template.csv
+├── .env                 # 환경 변수 설정 (직접 설정 필요)
 ├── .gitignore
+├── CHECKLIST.md         # 시작 전 체크리스트
+├── 사용가이드.md         # 사용자 가이드
+├── setup.ps1            # 자동 설치 스크립트
+├── setup-firewall.ps1   # 방화벽 설정 스크립트
 └── package.json         # 루트 패키지 (통합 실행 스크립트)
 ```
 

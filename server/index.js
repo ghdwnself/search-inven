@@ -15,7 +15,6 @@ const __dirname = path.dirname(__filename);
 
 // .env 파일 수동 로드 (Windows 호환성)
 const envPath = path.join(__dirname, '..', '.env');
-console.log('📄 .env 파일 경로:', envPath);
 
 try {
   const envContent = fs.readFileSync(envPath, 'utf8');
@@ -36,20 +35,19 @@ try {
   if (envVars.GOOGLE_DRIVE_FOLDER_ID) process.env.GOOGLE_DRIVE_FOLDER_ID = envVars.GOOGLE_DRIVE_FOLDER_ID;
   if (envVars.ADMIN_PASSWORD) process.env.ADMIN_PASSWORD = envVars.ADMIN_PASSWORD;
   
-  console.log('✅ .env 파일 로드 완료');
+  console.log('✅ 환경 변수 로드 완료');
 } catch (error) {
   console.error('❌ .env 파일 읽기 실패:', error.message);
+  console.error('   파일 위치:', envPath);
+  process.exit(1);
 }
 
-// 환경 변수 확인
-console.log('🔧 환경 변수 로드 상태:');
-console.log('   GOOGLE_SHEET_ID:', process.env.GOOGLE_SHEET_ID || '❌ 설정되지 않음');
-console.log('   GOOGLE_INVENTORY_SHEET_ID:', process.env.GOOGLE_INVENTORY_SHEET_ID || '❌ 설정되지 않음');
-console.log('   GOOGLE_DRIVE_FOLDER_ID:', process.env.GOOGLE_DRIVE_FOLDER_ID || '❌ 설정되지 않음');
-
+// 필수 환경 변수 확인
 if (!process.env.GOOGLE_SHEET_ID || !process.env.GOOGLE_DRIVE_FOLDER_ID) {
-  console.error('\n❌ 오류: .env 파일에 GOOGLE_SHEET_ID 및 GOOGLE_DRIVE_FOLDER_ID를 설정해주세요.');
-  console.error('   .env 파일 위치:', envPath);
+  console.error('❌ 필수 환경 변수가 설정되지 않았습니다.');
+  console.error('   GOOGLE_SHEET_ID:', process.env.GOOGLE_SHEET_ID ? '✅' : '❌');
+  console.error('   GOOGLE_DRIVE_FOLDER_ID:', process.env.GOOGLE_DRIVE_FOLDER_ID ? '✅' : '❌');
+  console.error('\n.env 파일을 확인해주세요.');
   process.exit(1);
 }
 

@@ -10,6 +10,10 @@ package-lock.json
 # Google API Credentials (민감한 정보!)
 credentials.json
 server/credentials.json
+*.json
+!package.json
+!package-lock.json
+!tsconfig.json
 
 # Build outputs
 dist/
