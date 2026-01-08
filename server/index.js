@@ -66,6 +66,10 @@ let imageMap = {};
 let inventoryMap = {}; // SKU별 재고 정보
 let pendingProducts = []; // 승인 대기 제품
 
+// 데이터 새로고침 상태
+let lastRefreshTime = null;
+let isRefreshing = false;
+
 // Google Sheets 인증 설정
 const SCOPES = [
   'https://www.googleapis.com/auth/spreadsheets',
@@ -301,7 +305,7 @@ async function loadSheetData() {
       const brand = row.get('Brand') || '';
       const name = row.get('ProductName_Short') || row.get('Product Name') || '';
       const category = row.get('Category') || '';
-      const subCategory = row.get('Sub_Category') || '';
+      const subCategory = row.get('Sub_Category') || row.get('SubCategory') || '';
       
       // 이미지 매핑
       const imageData = imageMap[sku];
@@ -320,6 +324,8 @@ async function loadSheetData() {
         // 추가 필드 (있으면 포함)
         stock: row.get('Stock') || null,
         price: row.get('Price') || null,
+        upc: row.get('UPC') || null,
+        activityStatus: row.get('Activity_Status') || null,
       };
     }).filter(p => p.sku); // SKU가 있는 제품만 포함
 
@@ -353,6 +359,43 @@ app.get('/api/brands', (req, res) => {
     const brands = [...new Set(products.map(p => p.brand).filter(Boolean))];
     brands.sort();
     res.json(brands);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 카테고리 목록 조회
+app.get('/api/categories', (req, res) => {
+  try {
+    const categories = [...new Set(products.map(p => p.category).filter(Boolean))];
+    categories.sort();
+    res.json(categories);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 서브카테고리 목록 조회 (카테고리별)
+app.get('/api/subcategories', (req, res) => {
+  try {
+    const { category } = req.query;
+    let subcategories;
+    
+    if (category) {
+      // 특정 카테고리의 서브카테고리만
+      subcategories = [...new Set(
+        products
+          .filter(p => p.category === category)
+          .map(p => p.subCategory)
+          .filter(Boolean)
+      )];
+    } else {
+      // 모든 서브카테고리
+      subcategories = [...new Set(products.map(p => p.subCategory).filter(Boolean))];
+    }
+    
+    subcategories.sort();
+    res.json(subcategories);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -756,11 +799,8 @@ app.get('/api/template/download', (req, res) => {
       'SubmittedBy'
     ];
     
-    // 예시 데이터 (가이드용)
-    const exampleData = [
-      ['NF-001', 'Notion Finds', 'Ceramic Mug', 'Kitchen', 'Drinkware', '12oz', 'White', '홍길동'],
-      ['NF-002', 'Notion Finds', 'Glass Vase', 'Decor', 'Vases', 'Medium', 'Clear', '김철수']
-    ];
+    // 빈 템플릿 (헤더만 포함)
+    const exampleData = [];
     
     // CSV 문자열 생성
     const rows = [headers, ...exampleData];
@@ -953,17 +993,86 @@ app.post('/api/products/upload', upload.single('file'), async (req, res) => {
 // 기존 API
 // ============================================
 
+// ============================================
+// 데이터 새로고침 API
+// ============================================
+
+// 새로고침 상태 조회
+app.get('/api/admin/refresh-status', (req, res) => {
+  res.json({
+    lastRefreshTime,
+    isRefreshing,
+    productsCount: products.length,
+    imagesCount: Object.keys(imageMap).length,
+    inventoryCount: Object.keys(inventoryMap).length
+  });
+});
+
+// 데이터 새로고침 (관리자 전용)
+app.post('/api/admin/refresh', adminAuth, async (req, res) => {
+  if (isRefreshing) {
+    return res.status(409).json({ error: '이미 새로고침이 진행 중입니다' });
+  }
+
+  try {
+    isRefreshing = true;
+    const { type } = req.query; // 'all', 'products', 'inventory', 'images'
+
+    console.log('🔄 데이터 새로고침 시작:', type || 'all');
+
+    if (!type || type === 'all' || type === 'images') {
+      imageMap = {};
+      await loadImagesFromDrive();
+    }
+
+    if (!type || type === 'all' || type === 'inventory') {
+      inventoryMap = {};
+      await loadInventoryData();
+    }
+
+    if (!type || type === 'all' || type === 'pending') {
+      pendingProducts = [];
+      await loadPendingData();
+    }
+
+    if (!type || type === 'all' || type === 'products') {
+      products = [];
+      await loadSheetData();
+    }
+
+    lastRefreshTime = new Date().toISOString();
+    console.log('✅ 데이터 새로고침 완료');
+
+    res.json({
+      success: true,
+      message: '데이터 새로고침 완료',
+      lastRefreshTime,
+      productsCount: products.length,
+      imagesCount: Object.keys(imageMap).length,
+      inventoryCount: Object.keys(inventoryMap).length,
+      pendingCount: pendingProducts.length
+    });
+  } catch (error) {
+    console.error('❌ 데이터 새로고침 실패:', error.message);
+    res.status(500).json({ error: '데이터 새로고침 실패: ' + error.message });
+  } finally {
+    isRefreshing = false;
+  }
+});
+
 // 헬스 체크
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
     productsLoaded: products.length,
-    imagesLoaded: Object.keys(imageMap).length
+    imagesLoaded: Object.keys(imageMap).length,
+    lastRefreshTime
   });
 });
 
 // 서버 시작
 initializeServer().then(() => {
+  lastRefreshTime = new Date().toISOString();
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 서버가 http://localhost:${PORT} 에서 실행 중입니다.`);
     console.log(`📡 네트워크 접속: http://<내부IP>:${PORT}`);

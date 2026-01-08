@@ -31,6 +31,14 @@ function AdminView() {
   const [approving, setApproving] = useState(false);
   const [approvalProgress, setApprovalProgress] = useState({ current: 0, total: 0 });
 
+  // 데이터 새로고침 상태
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshStatus, setRefreshStatus] = useState(null);
+
+  // 카테고리 드롭다운 데이터
+  const [categories, setCategories] = useState([]);
+  const [subCategories, setSubCategories] = useState([]);
+
   // 승인 대기 목록 로드
   const loadPendingProducts = async () => {
     try {
@@ -41,9 +49,78 @@ function AdminView() {
     }
   };
 
+  // 새로고침 상태 조회
+  const loadRefreshStatus = async () => {
+    try {
+      const response = await axios.get('/api/admin/refresh-status');
+      setRefreshStatus(response.data);
+    } catch (error) {
+      console.error('새로고침 상태 로드 실패:', error);
+    }
+  };
+
+  // 카테고리 목록 로드
+  const loadCategories = async () => {
+    try {
+      const response = await axios.get('/api/categories');
+      setCategories(response.data);
+    } catch (error) {
+      console.error('카테고리 로드 실패:', error);
+    }
+  };
+
+  // 서브카테고리 목록 로드
+  const loadSubCategories = async (category = '') => {
+    try {
+      const url = category ? `/api/subcategories?category=${category}` : '/api/subcategories';
+      const response = await axios.get(url);
+      setSubCategories(response.data);
+    } catch (error) {
+      console.error('서브카테고리 로드 실패:', error);
+    }
+  };
+
+  // 데이터 새로고침
+  const handleRefresh = async (type = 'all') => {
+    if (refreshing) return;
+
+    if (!confirm(`${type === 'all' ? '전체' : type} 데이터를 새로고침하시겠습니까?`)) {
+      return;
+    }
+
+    setRefreshing(true);
+    try {
+      const response = await axios.post(
+        `/api/admin/refresh?type=${type}`,
+        {},
+        { headers: { 'x-admin-password': password } }
+      );
+      
+      setRefreshStatus({
+        lastRefreshTime: response.data.lastRefreshTime,
+        productsCount: response.data.productsCount,
+        imagesCount: response.data.imagesCount,
+        inventoryCount: response.data.inventoryCount
+      });
+      
+      alert(`✅ 새로고침 완료!\n제품: ${response.data.productsCount}개\n이미지: ${response.data.imagesCount}개\n재고: ${response.data.inventoryCount}개`);
+      
+      // 승인 대기 목록도 새로고침
+      loadPendingProducts();
+    } catch (error) {
+      console.error('데이터 새로고침 실패:', error);
+      alert('데이터 새로고침 실패: ' + (error.response?.data?.error || error.message));
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
   useEffect(() => {
     if (isAuthenticated) {
       loadPendingProducts();
+      loadRefreshStatus();
+      loadCategories();
+      loadSubCategories();
     }
   }, [isAuthenticated]);
 
@@ -88,6 +165,12 @@ function AdminView() {
     // SKU 입력 시 실시간 중복 체크
     if (name === 'sku') {
       checkSKU(value);
+    }
+
+    // 카테고리 변경 시 서브카테곣0리 업데이트
+    if (name === 'category') {
+      setFormData(prev => ({ ...prev, subCategory: '' }));
+      loadSubCategories(value);
     }
   };
 
@@ -209,7 +292,7 @@ function AdminView() {
       const url = window.URL.createObjectURL(new Blob([response.data]));
       const link = document.createElement('a');
       link.href = url;
-      link.setAttribute('download', 'product_template.xlsx');
+      link.setAttribute('download', 'product_template.csv');
       document.body.appendChild(link);
       link.click();
       link.remove();
@@ -296,6 +379,38 @@ function AdminView() {
     <div className="admin-container">
       <div className="admin-header">
         <h1>🛠 관리자 페이지</h1>
+        
+        {/* 데이터 새로고침 상태 표시 */}
+        <div className="refresh-status">
+          {refreshStatus && (
+            <>
+              <div className="status-info">
+                <span className="status-label">📊 데이터:</span>
+                <span className="status-value">
+                  제품 {refreshStatus.productsCount}개 | 
+                  이미지 {refreshStatus.imagesCount}개 | 
+                  재고 {refreshStatus.inventoryCount}개
+                </span>
+              </div>
+              {refreshStatus.lastRefreshTime && (
+                <div className="status-info">
+                  <span className="status-label">🕒 마지막 업데이트:</span>
+                  <span className="status-value">
+                    {new Date(refreshStatus.lastRefreshTime).toLocaleString('ko-KR')}
+                  </span>
+                </div>
+              )}
+            </>
+          )}
+          <button 
+            className={`refresh-button ${refreshing ? 'refreshing' : ''}`}
+            onClick={() => handleRefresh('all')}
+            disabled={refreshing}
+          >
+            {refreshing ? '🔄 새로고침 중...' : '🔄 데이터 새로고침'}
+          </button>
+        </div>
+
         <div className="admin-tabs">
           <button
             className={`tab-button ${activeTab === 'register' ? 'active' : ''}`}
@@ -332,7 +447,7 @@ function AdminView() {
                   value={formData.sku}
                   onChange={handleInputChange}
                   required
-                  placeholder="예: NF-001"
+                  placeholder=""
                 />
                 {skuChecking && <span className="checking">확인 중...</span>}
                 {skuError && <span className="error">{skuError}</span>}
@@ -346,7 +461,7 @@ function AdminView() {
                   value={formData.brand}
                   onChange={handleInputChange}
                   required
-                  placeholder="예: Notion Finds"
+                  placeholder=""
                 />
               </div>
             </div>
@@ -359,31 +474,40 @@ function AdminView() {
                 value={formData.productName}
                 onChange={handleInputChange}
                 required
-                placeholder="예: Ceramic Mug Set"
+                placeholder=""
               />
             </div>
 
             <div className="form-row">
               <div className="form-group">
                 <label>카테고리</label>
-                <input
-                  type="text"
+                <select
                   name="category"
                   value={formData.category}
                   onChange={handleInputChange}
-                  placeholder="예: Kitchen"
-                />
+                  className="form-select"
+                >
+                  <option value="">카테고리 선택</option>
+                  {categories.map(cat => (
+                    <option key={cat} value={cat}>{cat}</option>
+                  ))}
+                </select>
               </div>
 
               <div className="form-group">
                 <label>서브 카테고리</label>
-                <input
-                  type="text"
+                <select
                   name="subCategory"
                   value={formData.subCategory}
                   onChange={handleInputChange}
-                  placeholder="예: Drinkware"
-                />
+                  className="form-select"
+                  disabled={!formData.category}
+                >
+                  <option value="">서브카테고리 선택</option>
+                  {subCategories.map(sub => (
+                    <option key={sub} value={sub}>{sub}</option>
+                  ))}
+                </select>
               </div>
             </div>
 
@@ -406,7 +530,7 @@ function AdminView() {
                   name="color"
                   value={formData.color}
                   onChange={handleInputChange}
-                  placeholder="예: White"
+                  placeholder=""
                 />
               </div>
             </div>
@@ -418,7 +542,7 @@ function AdminView() {
                 name="submittedBy"
                 value={formData.submittedBy}
                 onChange={handleInputChange}
-                placeholder="선택사항"
+                placeholder=""
               />
             </div>
 
@@ -457,7 +581,7 @@ function AdminView() {
               <div className="template-info">
                 <p><strong>필수 항목:</strong> SKU, Brand, ProductName</p>
                 <p><strong>선택 항목:</strong> Category, SubCategory, Size, Color, SubmittedBy</p>
-                <p>💡 예시 데이터가 포함되어 있으니 참고하세요</p>
+                <p>템플릿에 제품 정보를 입력하세요</p>
               </div>
             </div>
 
@@ -544,7 +668,7 @@ function AdminView() {
 
       {/* 승인 대기 탭 */}
       {activeTab === 'pending' && (
-        <div className="pending-section">
+        <div className="register-section">
           <div className="pending-header-section">
             <h2>⏳ 승인 대기 목록</h2>
             {pendingProducts.length > 0 && (
