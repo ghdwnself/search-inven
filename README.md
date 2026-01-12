@@ -2,6 +2,52 @@
 
 Google Sheets와 Google Drive를 연동한 재고 조회 시스템입니다.
 
+---
+
+## ⚡ 빠른 시작 (Git Clone 후 실행)
+
+### 1️⃣ 코드 다운로드
+```powershell
+git clone https://github.com/ghdwnself/search-inven.git
+cd search-inven
+```
+
+### 2️⃣ 필수 파일 준비 (수동)
+다음 2개 파일을 기존 서버에서 복사해 오세요:
+
+**`server/credentials.json`** (Google API 인증 키)
+```powershell
+# 기존 서버에서 이 파일을 복사해서 server/ 폴더에 넣으세요
+```
+
+**`.env`** (환경 변수)
+```powershell
+# 루트 폴더에 .env 파일을 만들고 아래 내용 입력:
+```
+```env
+GOOGLE_SHEET_ID=실제_시트_ID
+GOOGLE_DRIVE_FOLDER_ID=실제_드라이브_폴더_ID
+GOOGLE_INVENTORY_SHEET_ID=실제_재고시트_ID
+ADMIN_PASSWORD=admin1234
+```
+
+### 3️⃣ 설치 및 실행
+```powershell
+# 의존성 설치
+npm install
+
+# 서버 실행
+npm run dev
+```
+
+### 4️⃣ 접속 확인
+- 프론트엔드: http://localhost:3000
+- 백엔드: http://localhost:5000
+
+**완료! 🎉**
+
+---
+
 ## 📁 프로젝트 구조
 
 ```
